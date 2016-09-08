@@ -13,20 +13,15 @@
  */
 package com.meetme.plugins.jira.gerrit.adminui;
 
-import java.io.File;
-import java.io.FileOutputStream;
-import java.io.IOException;
-import java.io.InputStream;
-import java.net.URI;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
+import com.meetme.plugins.jira.gerrit.data.GerritConfiguration;
 
-import javax.servlet.ServletException;
-import javax.servlet.http.HttpServlet;
-import javax.servlet.http.HttpServletRequest;
-import javax.servlet.http.HttpServletResponse;
-import javax.ws.rs.core.Response.Status;
+import com.atlassian.jira.config.util.JiraHome;
+import com.atlassian.sal.api.auth.LoginUriProvider;
+import com.atlassian.sal.api.user.UserManager;
+import com.atlassian.templaterenderer.TemplateRenderer;
+import com.sonyericsson.hudson.plugins.gerrit.gerritevents.GerritQueryException;
+import com.sonyericsson.hudson.plugins.gerrit.gerritevents.GerritQueryHandler;
+import com.sonyericsson.hudson.plugins.gerrit.gerritevents.ssh.Authentication;
 
 import org.apache.commons.fileupload.FileItem;
 import org.apache.commons.fileupload.FileItemFactory;
@@ -38,11 +33,21 @@ import org.apache.commons.lang.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import com.atlassian.jira.config.util.JiraHome;
-import com.atlassian.sal.api.auth.LoginUriProvider;
-import com.atlassian.sal.api.user.UserManager;
-import com.atlassian.templaterenderer.TemplateRenderer;
-import com.meetme.plugins.jira.gerrit.data.GerritConfiguration;
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.net.URI;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+import javax.servlet.ServletException;
+import javax.servlet.http.HttpServlet;
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
 
 public class AdminServlet extends HttpServlet {
     private static final long serialVersionUID = -9175363090552720328L;
@@ -50,6 +55,10 @@ public class AdminServlet extends HttpServlet {
 
     private static final Object[] PACKAGE_PARTS = new String[] { "com", "meetme", "plugins", "jira", "gerrit" };
     private static final String CONTENT_TYPE = "text/html;charset=utf-8";
+
+    private static final String FIELD_ACTION = "action";
+    private static final String ACTION_SAVE = "save";
+    private static final String ACTION_TEST = "test";
 
     private static String TEMPLATE_ADMIN = "templates/admin.vm";
 
@@ -98,79 +107,133 @@ public class AdminServlet extends HttpServlet {
             map.put(GerritConfiguration.FIELD_HTTP_PASSWORD, config.getHttpPassword());
         }
 
+        map.put(GerritConfiguration.FIELD_SHOW_EMPTY_PANEL, String.valueOf(config.getShowsEmptyPanel()));
+
         return map;
     }
 
     @SuppressWarnings("unchecked")
     @Override
     protected void doPost(final HttpServletRequest req, final HttpServletResponse resp) throws ServletException, IOException {
+        Map<String, Object> map;
+
         try {
-            String username = userManager.getRemoteUsername(req);
-
-            if (username == null || !userManager.isSystemAdmin(username)) {
-                redirectToLogin(req, resp);
-                return;
-            }
-
-            File privateKeyPath = null;
-            FileItemFactory factory = new DiskFileItemFactory();
-            ServletFileUpload upload = new ServletFileUpload(factory);
-            List<FileItem> items;
-
-            try {
-                // Unfortunately "multipart" makes it so every field comes through as a "FileItem"
-
-                items = (List<FileItem>) upload.parseRequest(req);
-            } catch (FileUploadException e) {
-                e.printStackTrace(resp.getWriter());
-                return;
-            }
-
-            this.setAllFields(items);
-            privateKeyPath = this.doUploadPrivateKey(items, configurationManager.getSshHostname());
-
-            if (privateKeyPath != null) {
-                // We'll store the *path* to the file in ConfigResource, to make it easy to look it
-                // up in the future.
-                log.debug("---- Saved ssh private key at: " + privateKeyPath.toString() + " ----");
-                configurationManager.setSshPrivateKey(privateKeyPath);
-            } else if (configurationManager.getSshPrivateKey() != null) {
-                log.debug("---- Private key is already on file, and not being replaced. ----");
-            } else {
-                // TODO: is this a failure?
-                log.info("**** No private key was uploaded, and no key currently on file!  Requests will fail. ****");
-            }
+            map = handlePost(req, resp);
         } catch (Exception e) {
             e.printStackTrace(resp.getWriter());
             return;
         }
 
         resp.setContentType(CONTENT_TYPE);
-        renderer.render(TEMPLATE_ADMIN, configToMap(configurationManager), resp.getWriter());
+        renderer.render(TEMPLATE_ADMIN, map, resp.getWriter());
+    }
+
+    private Map<String, Object> handlePost(HttpServletRequest req, HttpServletResponse resp) throws IOException {
+        String username = userManager.getRemoteUsername(req);
+
+        if (username == null || !userManager.isSystemAdmin(username)) {
+            redirectToLogin(req, resp);
+            return null;
+        }
+
+        File privateKeyPath;
+        FileItemFactory factory = new DiskFileItemFactory();
+        ServletFileUpload upload = new ServletFileUpload(factory);
+        List<FileItem> items;
+
+        try {
+            // Unfortunately "multipart" makes it so every field comes through as a "FileItem"
+            items = upload.parseRequest(req);
+        } catch (FileUploadException e) {
+            e.printStackTrace(resp.getWriter());
+            return null;
+        }
+
+        setAllFields(items);
+        privateKeyPath = this.doUploadPrivateKey(items, configurationManager.getSshHostname());
+
+        if (privateKeyPath != null) {
+            // We'll store the *path* to the file in ConfigResource, to make it easy to look it
+            // up in the future.
+            log.debug("---- Saved ssh private key at: " + privateKeyPath.toString() + " ----");
+            configurationManager.setSshPrivateKey(privateKeyPath);
+        } else if (configurationManager.getSshPrivateKey() != null) {
+            log.debug("---- Private key is already on file, and not being replaced. ----");
+        } else {
+            // TODO: is this a failure?
+            log.info("**** No private key was uploaded, and no key currently on file!  Requests will fail. ****");
+        }
+
+        Map<String, Object> map = configToMap(configurationManager);
+        String action = getAction(items);
+
+        if (ACTION_TEST.equals(action)) {
+            performConnectionTest(configurationManager, map);
+        }
+
+        return map;
+    }
+
+    private void performConnectionTest(GerritConfiguration configuration, Map<String, Object> map) {
+        map.put("testResult", Boolean.FALSE);
+
+        if (!configuration.isSshValid()) {
+            map.put("testError", "not configured");
+            return;
+        }
+
+        Authentication auth = new Authentication(configuration.getSshPrivateKey(), configuration.getSshUsername());
+        GerritQueryHandler query = new GerritQueryHandler(configuration.getSshHostname(), configuration.getSshPort(), null, auth);
+
+        try {
+            query.queryJava("limit:1", false, false, false);
+            map.put("testResult", Boolean.TRUE);
+        } catch (IOException e) {
+            e.printStackTrace();
+            map.put("testError", e.getMessage());
+        } catch (GerritQueryException e) {
+            e.printStackTrace();
+            map.put("testError", e.getMessage());
+        }
+    }
+
+    private String getAction(List<FileItem> items) {
+        for (FileItem item : items) {
+            final String fieldName = item.getFieldName();
+            if (FIELD_ACTION.equals(fieldName)) return item.getString();
+        }
+
+        return null;
     }
 
     private void setAllFields(final List<FileItem> items) {
+        Set<String> allFields = new HashSet<>();
+
         for (FileItem item : items) {
             final String fieldName = item.getFieldName();
+            allFields.add(fieldName);
 
-            if (fieldName.equals(GerritConfiguration.FIELD_HTTP_BASE_URL)) {
+            if (GerritConfiguration.FIELD_HTTP_BASE_URL.equals(fieldName)) {
                 configurationManager.setHttpBaseUrl(item.getString());
-            } else if (fieldName.equals(GerritConfiguration.FIELD_HTTP_USERNAME)) {
+            } else if (GerritConfiguration.FIELD_HTTP_USERNAME.equals(fieldName)) {
                 configurationManager.setHttpUsername(item.getString());
-            } else if (fieldName.equals(GerritConfiguration.FIELD_HTTP_PASSWORD)) {
+            } else if (GerritConfiguration.FIELD_HTTP_PASSWORD.equals(fieldName)) {
                 configurationManager.setHttpPassword(item.getString());
-            } else if (fieldName.equals(GerritConfiguration.FIELD_SSH_HOSTNAME)) {
+            } else if (GerritConfiguration.FIELD_SSH_HOSTNAME.equals(fieldName)) {
                 configurationManager.setSshHostname(item.getString());
-            } else if (fieldName.equals(GerritConfiguration.FIELD_SSH_USERNAME)) {
+            } else if (GerritConfiguration.FIELD_SSH_USERNAME.equals(fieldName)) {
                 configurationManager.setSshUsername(item.getString());
-            } else if (fieldName.equals(GerritConfiguration.FIELD_SSH_PORT)) {
+            } else if (GerritConfiguration.FIELD_SSH_PORT.equals(fieldName)) {
                 configurationManager.setSshPort(Integer.parseInt(item.getString()));
-            } else if (fieldName.equals(GerritConfiguration.FIELD_QUERY_ISSUE)) {
+            } else if (GerritConfiguration.FIELD_QUERY_ISSUE.equals(fieldName)) {
                 configurationManager.setIssueSearchQuery(item.getString());
-            } else if (fieldName.equals(GerritConfiguration.FIELD_QUERY_PROJECT)) {
+            } else if (GerritConfiguration.FIELD_QUERY_PROJECT.equals(fieldName)) {
                 configurationManager.setProjectSearchQuery(item.getString());
             }
         }
+
+        boolean showsEmptyPanelChecked = allFields.contains(GerritConfiguration.FIELD_SHOW_EMPTY_PANEL);
+        configurationManager.setShowEmptyPanel(showsEmptyPanelChecked);
     }
 
     private File doUploadPrivateKey(final List<FileItem> items, final String sshHostname) throws IOException {
@@ -189,9 +252,9 @@ public class AdminServlet extends HttpServlet {
 
                 try {
                     privateKeyPath = File.createTempFile(tempFilePrefix, tempFileSuffix, dataDir);
-                }
-                catch (IOException e) {
-                    log.info("---- Cannot create temporary file: " + e.getMessage() + ": " + dataDir.toString() + tempFilePrefix + tempFileSuffix + " ----");
+                } catch (IOException e) {
+                    log.info("---- Cannot create temporary file: " + e.getMessage() + ": " + dataDir
+                            .toString() + tempFilePrefix + tempFileSuffix + " ----");
                     break;
                 }
 
